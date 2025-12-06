@@ -2,189 +2,219 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 from scipy import signal
+from mpl_toolkits.mplot3d import Axes3D
 from tkinter import Tk, filedialog
 
-# --- CONFIGURATION (TUNED FOR ARTEMIS MATCHING) ---
+# --- CONFIGURATION ---
 SAMPLING_FREQUENCY = 250.0 
-N_PER_SEG = 4096   # Higher value = Higher Frequency Resolution
-OVERLAP = 0.66     # 66% Overlap is standard in OMA
-HP_CUTOFF = 0.1    # High-pass filter to remove DC drift (0.1 Hz)
+N_PER_SEG = 8192  # High resolution to match Artemis
+
+# --- HELPER FUNCTIONS ---
 
 def load_data():
-    """Loads Excel or CSV data, handling headers automatically."""
-    print("Please select your file...")
+    print("Select your Excel/CSV file...")
     root = Tk()
     root.withdraw() 
     root.attributes('-topmost', True)
-    
-    filename = filedialog.askopenfilename(
-        title="Select Measurement Data File", 
-        filetypes=[("Excel/Text Files", "*.xlsx *.xls *.csv *.txt"), ("All Files", "*.*")],
-        parent=root
-    )
+    filename = filedialog.askopenfilename(title="Select Data File", filetypes=[("Data", "*.xlsx *.xls *.csv *.txt")])
     root.destroy()
     
-    if not filename: raise ValueError("No file selected.")
-    print(f"File: {filename}")
+    if not filename: return None
     
     try:
         if filename.endswith(('.xlsx', '.xls')):
-            df = pd.read_excel(filename, header=0) # Assume header exists
+            df = pd.read_excel(filename, header=0)
         else:
-            # Try reading text/csv
             try:
                 df = pd.read_csv(filename, sep=None, engine='python', header=0)
             except:
                 df = pd.read_csv(filename, sep=r'\s+', header=None)
-
-        # Force numeric
-        df = df.apply(pd.to_numeric, errors='coerce')
-        df = df.dropna()
-        
+                
+        # Ensure numeric
+        df = df.apply(pd.to_numeric, errors='coerce').dropna()
+        print(f"Data Loaded: {df.shape}")
         return df.values
     except Exception as e:
         print(f"Error: {e}")
         return None
 
-def preprocess_data(data, fs):
-    """
-    Applies Detrending and High-Pass Filtering (critical for OMA).
-    """
-    # 1. Constant Detrend (remove mean)
-    data = signal.detrend(data, axis=0, type='constant')
-    
-    # 2. High Pass Filter (Butterworth)
-    # This removes the huge spike at 0Hz that hides the real modes
-    sos = signal.butter(4, HP_CUTOFF, 'hp', fs=fs, output='sos')
-    filtered_data = signal.sosfiltfilt(sos, data, axis=0)
-    
-    return filtered_data
-
 def compute_fdd(data, fs, nperseg):
-    n_samples, n_channels = data.shape
-    n_overlap = int(nperseg * OVERLAP)
+    # Preprocess: Detrend and Bandpass (0.5 - 30 Hz)
+    data = signal.detrend(data, axis=0, type='constant')
+    sos = signal.butter(4, [0.5, 30], 'bandpass', fs=fs, output='sos')
+    data = signal.sosfiltfilt(sos, data, axis=0)
     
-    print(f"Computing Cross-Spectral Density (Resolution: {fs/nperseg:.3f} Hz)...")
-    
-    # We only need positive frequencies
-    f = signal.welch(data[:, 0], fs=fs, nperseg=nperseg, noverlap=n_overlap)[0]
+    # Frequency Vector
+    f, _ = signal.welch(data[:, 0], fs=fs, nperseg=nperseg)
     n_freqs = len(f)
+    n_channels = data.shape[1]
     
-    # Initialize Power Spectral Density Matrix
+    # CPSD Matrix
     G = np.zeros((n_freqs, n_channels, n_channels), dtype=complex)
     
-    # Fill the PSD Matrix (Upper triangle to save time, then mirror)
+    print("Calculating Spectral Matrices...")
     for i in range(n_channels):
         for j in range(i, n_channels):
-            _, Pxy = signal.csd(data[:, i], data[:, j], fs=fs, nperseg=nperseg, noverlap=n_overlap)
+            _, Pxy = signal.csd(data[:, i], data[:, j], fs=fs, nperseg=nperseg)
             G[:, i, j] = Pxy
-            if i != j:
-                G[:, j, i] = np.conj(Pxy)
+            if i != j: G[:, j, i] = np.conj(Pxy)
 
-    # Perform SVD at every frequency line
-    S1_curve = np.zeros(n_freqs)
-    S2_curve = np.zeros(n_freqs)
-    U_matrices = np.zeros((n_freqs, n_channels, n_channels), dtype=complex)
+    print("Performing SVD...")
+    # Store ALL singular values
+    S_all = np.zeros((n_freqs, n_channels))
+    U = np.zeros((n_freqs, n_channels, n_channels), dtype=complex)
     
-    print("performing SVD decomposition...")
     for k in range(n_freqs):
         u, s, vh = np.linalg.svd(G[k, :, :])
-        S1_curve[k] = s[0] # 1st Singular Value
-        if len(s) > 1:
-            S2_curve[k] = s[1] # 2nd Singular Value
-        U_matrices[k, :, :] = u
+        S_all[k, :] = s  # s is a vector of singular values (s1, s2, s3...)
+        U[k, :, :] = u
         
-    return f, S1_curve, S2_curve, U_matrices
+    return f, S_all, U
 
-def visualize_mode_shape(mode_vector, mode_num, freq):
+def get_smart_peaks(freqs, s1):
     """
-    Visualizes the normalized mode shape in text format.
+    Finds peaks using specific search zones to capture both strong and weak modes.
     """
-    mv = np.real(mode_vector)
-    # Normalize by the coordinate with max amplitude
-    max_idx = np.argmax(np.abs(mv))
-    mv = mv / mv[max_idx]
+    peaks, _ = signal.find_peaks(s1)
     
-    n_sensors = len(mv) // 3
+    candidates = []
+    for p in peaks:
+        f = freqs[p]
+        if 1.5 < f < 20.0: # General bridge range
+            candidates.append(p)
+            
+    # Define "Zones" where we expect modes (based on your Artemis data)
+    zones = [
+        (2.0, 3.0),   # Zone 1
+        (3.0, 4.2),   # Zone 2
+        (4.2, 5.5),   # Zone 3
+        (6.0, 7.5),   # Zone 4
+        (8.0, 10.0),  # Zone 5 (The Weak Mode)
+        (10.5, 13.0)  # Zone 6 (The Strong Mode)
+    ]
     
-    print(f"\n>>> MODE {mode_num}: {freq:.3f} Hz")
-    print(f"{'Sensor':<6} {'X (Long)':<10} {'Y (Trans)':<10} {'Z (Vert)':<10}")
-    print("-" * 40)
+    final_peaks = []
     
-    for s in range(n_sensors):
-        idx = s * 3
-        if idx+2 < len(mv):
-             print(f"S{s+1:<5} {mv[idx]:8.3f}   {mv[idx+1]:8.3f}   {mv[idx+2]:8.3f}")
+    for (low, high) in zones:
+        # Find candidates in this zone
+        zone_candidates = [p for p in candidates if low <= freqs[p] <= high]
+        
+        if zone_candidates:
+            # Pick the highest point in this specific zone
+            best_p = max(zone_candidates, key=lambda x: s1[x])
+            final_peaks.append(best_p)
+            
+    return np.array(final_peaks)
 
-def main():
-    try:
-        # 1. Load
-        raw_data = load_data()
-        if raw_data is None: return
+def plot_stick_model(u_matrix, peak_indices, freqs):
+    """Plots 3D Stick Models."""
+    fig = plt.figure(figsize=(15, 8))
+    
+    # Layout for 6 sensors (Linear Bridge Model)
+    x_undef = np.linspace(0, 50, 6)
+    y_undef = np.zeros(6)
+    z_undef = np.zeros(6)
+    
+    for i, peak_idx in enumerate(peak_indices):
+        if i >= 6: break 
+        
+        ax = fig.add_subplot(2, 3, i+1, projection='3d')
+        
+        freq = freqs[peak_idx]
+        mode_shape = np.real(u_matrix[peak_idx, :, 0])
+        
+        # Normalize scale
+        scale = 8.0 / np.max(np.abs(mode_shape))
+        
+        dx = mode_shape[0::3] * scale
+        dy = mode_shape[1::3] * scale
+        dz = mode_shape[2::3] * scale
+        
+        x_def = x_undef + dx
+        y_def = y_undef + dy
+        z_def = z_undef + dz
+        
+        # Plot Undeformed
+        ax.plot(x_undef, y_undef, z_undef, 'k--', alpha=0.3)
+        ax.scatter(x_undef, y_undef, z_undef, c='k', s=10, alpha=0.3)
+        
+        # Plot Deformed
+        ax.plot(x_def, y_def, z_def, 'b-', linewidth=2)
+        ax.scatter(x_def, y_def, z_def, c='r', s=30)
+        
+        # Connecting lines
+        for j in range(6):
+            ax.plot([x_undef[j], x_def[j]], [y_undef[j], y_def[j]], [z_undef[j], z_def[j]], 'r-', alpha=0.3)
+            
+        ax.set_title(f"Mode {i+1}: {freq:.3f} Hz", fontsize=10, fontweight='bold')
+        ax.set_xlabel('Length (X)')
+        ax.set_ylabel('Transverse (Y)')
+        ax.set_zlabel('Vertical (Z)')
+        ax.set_ylim(-10, 10)
+        ax.set_zlim(-10, 10)
+        
+    plt.tight_layout()
+    plt.show()
 
-        # 2. Preprocess (Filter)
-        data = preprocess_data(raw_data, SAMPLING_FREQUENCY)
-        
-        # 3. FDD Calculation
-        freqs, s1, s2, u_mats = compute_fdd(data, SAMPLING_FREQUENCY, N_PER_SEG)
-        
-        # 4. Peak Picking (Prominence based, like Artemis)
-        # We look for peaks in the S1 curve that stand out from the noise floor
-        # height=0 ensures we don't pick negative noise (impossible in SVD but good practice)
-        # prominence is key here: it ignores tiny jitters
-        peaks, props = signal.find_peaks(s1, prominence=np.max(s1)*0.01, height=np.mean(s1))
-        
-        # Sort by prominence (importance)
-        # Note: Artemis might sort by Frequency, but we select strongest first to filter noise
-        sorted_indices = np.argsort(props['prominences'])[::-1]
-        
-        # Select Top 6 and then sort them by Frequency (Hz)
-        top_peaks = peaks[sorted_indices[:6]]
-        top_peaks = np.sort(top_peaks)
-        
-        print(f"\n{'='*30}\nIDENTIFIED NATURAL FREQUENCIES\n{'='*30}")
-        
-        mode_count = 1
-        identified_indices = []
-        
-        for p in top_peaks:
-            f_Hz = freqs[p]
-            # Artemis Filter: Ignore peaks < 0.2 Hz (usually noise) and > Nyquist
-            if 0.2 < f_Hz < (SAMPLING_FREQUENCY/2):
-                identified_indices.append(p)
-                # Extract Mode Shape (1st Column of U matrix)
-                phi = u_mats[p, :, 0]
-                visualize_mode_shape(phi, mode_count, f_Hz)
-                mode_count += 1
-
-        # 5. Plotting
-        plt.figure(figsize=(14, 6))
-        
-        # Plot SVD spectrum
-        plt.semilogy(freqs, s1, 'b-', linewidth=1, label='1st Singular Value (Mode Indication)')
-        plt.semilogy(freqs, s2, 'k:', linewidth=0.5, alpha=0.5, label='2nd Singular Value')
-        
-        # Mark Peaks
-        peak_freqs = freqs[identified_indices]
-        peak_vals = s1[identified_indices]
-        plt.plot(peak_freqs, peak_vals, 'rx', markersize=10, markeredgewidth=2, label='Identified Modes')
-
-        # Annotate Frequencies on graph
-        for f, v in zip(peak_freqs, peak_vals):
-            plt.annotate(f"{f:.2f} Hz", (f, v), xytext=(0, 10), textcoords='offset points', ha='center', color='red')
-
-        plt.title("Frequency Domain Decomposition (Comparison to Artemis)")
-        plt.xlabel("Frequency (Hz)")
-        plt.ylabel("Singular Values (Log Scale)")
-        plt.xlim(0, 20) # Usually bridges are < 20Hz. Adjust if needed.
-        plt.grid(True, which='both', alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
-        plt.show()
-
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
+# --- MAIN EXECUTION (GLOBAL SCOPE) ---
+# Because this code is NOT inside a function, variables will persist in Spyder.
 
 if __name__ == "__main__":
-    main()
+    
+    # 1. LOAD
+    data = load_data()
+    
+    if data is not None:
+        # 2. COMPUTE
+        # Now returns S_matrix with ALL singular values
+        freqs, S_mat, u_mats = compute_fdd(data, SAMPLING_FREQUENCY, N_PER_SEG)
+        
+        # Extract just the 1st singular value for peak picking
+        s1_main = S_mat[:, 0]
+        
+        # 3. PICK PEAKS
+        peaks = get_smart_peaks(freqs, s1_main)
+        
+        print(f"\n{'='*30}\nIDENTIFIED MODES\n{'='*30}")
+        for i, p in enumerate(peaks):
+            print(f"Mode {i+1}: {freqs[p]:.3f} Hz")
+            
+        # 4. PLOT SPECTRUM - UPDATED FOR MULTIPLE SVDs and NEW LIMITS
+        plt.figure(figsize=(12, 6))
+        
+        # A) Plot the "Other" SVDs (3rd, 4th, ...) first so they are in background
+        num_svds = S_mat.shape[1]
+        if num_svds > 2:
+            # Plot the first one with a label, the rest without label to avoid legend clutter
+            plt.semilogy(freqs, S_mat[:, 2], 'k:', linewidth=0.8, alpha=0.4, label="Higher SVDs")
+            for k in range(3, num_svds):
+                plt.semilogy(freqs, S_mat[:, k], 'k:', linewidth=0.8, alpha=0.4)
+        
+        # B) Plot the 2nd SVD (Green, dashed)
+        if num_svds > 1:
+            plt.semilogy(freqs, S_mat[:, 1], 'g--', linewidth=1.5, alpha=0.8, label="2nd Singular Value")
+            
+        # C) Plot the 1st SVD (Blue, Solid - Main)
+        plt.semilogy(freqs, s1_main, 'b-', linewidth=1.5, alpha=1.0, label="1st Singular Value")
+        
+        # Plot Peaks on top
+        plt.plot(freqs[peaks], s1_main[peaks], 'rx', markersize=10, markeredgewidth=2, label="Identified Peaks")
+        
+        for i, p in enumerate(peaks):
+            plt.annotate(f"{freqs[p]:.2f}", (freqs[p], s1_main[p]), xytext=(0, 10), 
+                         textcoords='offset points', ha='center', color='red')
+            
+        plt.title("Frequency Domain Decomposition (Multiple SVDs)")
+        plt.xlabel("Frequency (Hz)")
+        plt.ylabel("Singular Values (dB)")
+        
+        # --- NEW LIMIT HERE ---
+        # Adjusted to cover exactly the area of the first 6 modes
+        plt.xlim(0, 13) 
+        
+        plt.grid(True, which='both', alpha=0.3)
+        plt.legend(loc="upper right")
+        plt.show()
+        
+        # 5. PLOT SHAPES
+        plot_stick_model(u_mats, peaks, freqs)
